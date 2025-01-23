@@ -18,6 +18,8 @@ import (
 const (
 	relType_Value = iota
 	relType_Import
+	relType_Addend = iota
+	relType_Resolver
 )
 
 type Module interface {
@@ -34,29 +36,33 @@ var (
 	relInfoMap = map[elf.Machine]map[uint32]uint32{
 		elf.EM_ARM: {
 			uint32(elf.R_ARM_ABS32):     elf.R_INFO32(4, relType_Value),
-			uint32(elf.R_ARM_RELATIVE):  elf.R_INFO32(4, relType_Value),
+			uint32(elf.R_ARM_RELATIVE):  elf.R_INFO32(4, relType_Addend),
 			uint32(elf.R_ARM_GLOB_DAT):  elf.R_INFO32(4, relType_Import),
 			uint32(elf.R_ARM_JUMP_SLOT): elf.R_INFO32(4, relType_Import),
+			uint32(elf.R_ARM_IRELATIVE): elf.R_INFO32(4, relType_Resolver),
 		},
 		elf.EM_AARCH64: {
 			uint32(elf.R_AARCH64_ABS64):     elf.R_INFO32(8, relType_Value),
 			uint32(elf.R_AARCH64_ABS32):     elf.R_INFO32(4, relType_Value),
-			uint32(elf.R_AARCH64_RELATIVE):  elf.R_INFO32(8, relType_Value),
+			uint32(elf.R_AARCH64_RELATIVE):  elf.R_INFO32(8, relType_Addend),
 			uint32(elf.R_AARCH64_GLOB_DAT):  elf.R_INFO32(8, relType_Import),
 			uint32(elf.R_AARCH64_JUMP_SLOT): elf.R_INFO32(8, relType_Import),
+			uint32(elf.R_AARCH64_IRELATIVE): elf.R_INFO32(8, relType_Resolver),
 		},
 		elf.EM_386: {
-			uint32(elf.R_386_32):       elf.R_INFO32(4, relType_Value),
-			uint32(elf.R_386_RELATIVE): elf.R_INFO32(4, relType_Value),
-			uint32(elf.R_386_GLOB_DAT): elf.R_INFO32(4, relType_Import),
-			uint32(elf.R_386_JMP_SLOT): elf.R_INFO32(4, relType_Import),
+			uint32(elf.R_386_32):        elf.R_INFO32(4, relType_Value),
+			uint32(elf.R_386_RELATIVE):  elf.R_INFO32(4, relType_Addend),
+			uint32(elf.R_386_GLOB_DAT):  elf.R_INFO32(4, relType_Import),
+			uint32(elf.R_386_JMP_SLOT):  elf.R_INFO32(4, relType_Import),
+			uint32(elf.R_386_IRELATIVE): elf.R_INFO32(4, relType_Resolver),
 		},
 		elf.EM_X86_64: {
-			uint32(elf.R_X86_64_64):       elf.R_INFO32(8, relType_Value),
-			uint32(elf.R_X86_64_32):       elf.R_INFO32(4, relType_Value),
-			uint32(elf.R_X86_64_RELATIVE): elf.R_INFO32(8, relType_Value),
-			uint32(elf.R_X86_64_GLOB_DAT): elf.R_INFO32(8, relType_Import),
-			uint32(elf.R_X86_64_JMP_SLOT): elf.R_INFO32(8, relType_Import),
+			uint32(elf.R_X86_64_64):        elf.R_INFO32(8, relType_Value),
+			uint32(elf.R_X86_64_32):        elf.R_INFO32(4, relType_Value),
+			uint32(elf.R_X86_64_RELATIVE):  elf.R_INFO32(8, relType_Addend),
+			uint32(elf.R_X86_64_GLOB_DAT):  elf.R_INFO32(8, relType_Import),
+			uint32(elf.R_X86_64_JMP_SLOT):  elf.R_INFO32(8, relType_Import),
+			uint32(elf.R_X86_64_IRELATIVE): elf.R_INFO32(8, relType_Resolver),
 		},
 	}
 )
@@ -74,6 +80,7 @@ type module struct {
 	symbols []*elf.Symbol
 	mu      sync.Mutex
 	rels    []debugger.ControlHandler
+	ifunc   sync.Map
 }
 
 func (m *module) init() {
@@ -147,17 +154,17 @@ func (m *module) Init(ctx context.Context) error {
 
 func (m *module) FindSymbol(name string) (uint64, error) {
 	if sym, err := m.findGNUHashSymbol(name); sym != nil {
-		return sym.Value, nil
+		return m.resolveSymbolAddress(sym), nil
 	} else if err != nil {
 		return 0, err
 	} else if sym, err = m.findHashSymbol(name); sym != nil {
-		return sym.Value, nil
+		return m.resolveSymbolAddress(sym), nil
 	} else if err != nil {
 		return 0, err
 	}
 	for _, sym := range m.symbols {
 		if !IsImportSymbol(sym) && sym.Name == name {
-			return sym.Value, nil
+			return m.resolveSymbolAddress(sym), nil
 		}
 	}
 	return 0, debugger.ErrSymbolNotFound
@@ -179,7 +186,7 @@ func (m *module) Symbols(yield func(debugger.Symbol) bool) {
 		sym := m.GetSymbol(i)
 		if IsImportSymbol(sym) {
 			continue
-		} else if !yield(debugger.Symbol{Name: sym.Name, Value: sym.Value}) {
+		} else if !yield(debugger.Symbol{Name: sym.Name, Value: m.resolveSymbolAddress(sym)}) {
 			break
 		}
 	}
@@ -381,6 +388,16 @@ func (m *module) relocation() {
 			m.handleRela64(sr)
 		}
 	}
+	sz = m.dynamic[DT_RELRSZ]
+	for i, v := range m.dynamic[DT_RELR] {
+		sr := m.sectionReader(v, sz[i])
+		switch m.header.Class {
+		case elf.ELFCLASS32:
+			m.handleRelr32(sr)
+		case elf.ELFCLASS64:
+			m.handleRelr64(sr)
+		}
+	}
 	plt := m.dynamic[elf.DT_PLTREL]
 	sz = m.dynamic[elf.DT_PLTRELSZ]
 	for i, v := range m.dynamic[elf.DT_JMPREL] {
@@ -400,16 +417,6 @@ func (m *module) relocation() {
 			case elf.ELFCLASS64:
 				m.handleRela64(sr)
 			}
-		}
-	}
-	sz = m.dynamic[DT_RELRSZ]
-	for i, v := range m.dynamic[DT_RELR] {
-		sr := m.sectionReader(v, sz[i])
-		switch m.header.Class {
-		case elf.ELFCLASS32:
-			m.handleRelr32(sr)
-		case elf.ELFCLASS64:
-			m.handleRelr64(sr)
 		}
 	}
 }
@@ -621,14 +628,23 @@ func (m *module) handleRel32(r io.Reader) {
 		if info, ok := infos[elf.R_TYPE32(rel.Info)]; ok {
 			addr := m.BaseAddr() + uint64(rel.Off)
 			size := uint64(elf.R_SYM32(info))
+			addend := uint64(0)
 			switch elf.R_TYPE32(info) {
 			case relType_Import:
-				m.handleImport(sym, addr, size, 0)
+				m.handleImport(sym, addr, size, addend)
+			case relType_Addend:
+				emu.MemReadPtr(addr, size, unsafe.Pointer(&addend))
+				fallthrough
 			case relType_Value:
+				value := m.BaseAddr() + addend
 				if sym != nil {
-					value := m.BaseAddr() + sym.Value
-					emu.MemWritePtr(addr, size, unsafe.Pointer(&value))
+					value += sym.Value
 				}
+				emu.MemWritePtr(addr, size, unsafe.Pointer(&value))
+			case relType_Resolver:
+				emu.MemReadPtr(addr, size, unsafe.Pointer(&addend))
+				value, _ := m.resolve(context.TODO(), m.BaseAddr()+addend)
+				emu.MemWritePtr(addr, size, unsafe.Pointer(&value))
 			}
 		}
 	}
@@ -650,14 +666,23 @@ func (m *module) handleRel64(r io.Reader) {
 		if info, ok := infos[elf.R_TYPE64(rel.Info)]; ok {
 			addr := m.BaseAddr() + rel.Off
 			size := uint64(elf.R_SYM32(info))
+			addend := uint64(0)
 			switch elf.R_TYPE32(info) {
 			case relType_Import:
-				m.handleImport(sym, addr, size, 0)
+				m.handleImport(sym, addr, size, addend)
+			case relType_Addend:
+				emu.MemReadPtr(addr, size, unsafe.Pointer(&addend))
+				fallthrough
 			case relType_Value:
+				value := m.BaseAddr() + addend
 				if sym != nil {
-					value := m.BaseAddr() + sym.Value
-					emu.MemWritePtr(addr, size, unsafe.Pointer(&value))
+					value += sym.Value
 				}
+				emu.MemWritePtr(addr, size, unsafe.Pointer(&value))
+			case relType_Resolver:
+				emu.MemReadPtr(addr, size, unsafe.Pointer(&addend))
+				value, _ := m.resolve(context.TODO(), m.BaseAddr()+addend)
+				emu.MemWritePtr(addr, size, unsafe.Pointer(&value))
 			}
 		}
 	}
@@ -682,11 +707,14 @@ func (m *module) handleRela32(r io.Reader) {
 			switch elf.R_TYPE32(info) {
 			case relType_Import:
 				m.handleImport(sym, addr, size, uint64(rela.Addend))
-			case relType_Value:
+			case relType_Value, relType_Addend:
 				value := m.BaseAddr() + uint64(rela.Addend)
 				if sym != nil {
 					value += sym.Value
 				}
+				emu.MemWritePtr(addr, size, unsafe.Pointer(&value))
+			case relType_Resolver:
+				value, _ := m.resolve(context.TODO(), m.BaseAddr()+uint64(rela.Addend))
 				emu.MemWritePtr(addr, size, unsafe.Pointer(&value))
 			}
 		}
@@ -712,11 +740,14 @@ func (m *module) handleRela64(r io.Reader) {
 			switch elf.R_TYPE32(info) {
 			case relType_Import:
 				m.handleImport(sym, addr, size, uint64(rela.Addend))
-			case relType_Value:
+			case relType_Value, relType_Addend:
 				value := m.BaseAddr() + uint64(rela.Addend)
 				if sym != nil {
 					value += sym.Value
 				}
+				emu.MemWritePtr(addr, size, unsafe.Pointer(&value))
+			case relType_Resolver:
+				value, _ := m.resolve(context.TODO(), m.BaseAddr()+uint64(rela.Addend))
 				emu.MemWritePtr(addr, size, unsafe.Pointer(&value))
 			}
 		}
@@ -790,14 +821,14 @@ func (m *module) handleImport(sym *elf.Symbol, addr, size, added uint64) {
 			if err != nil {
 				continue
 			}
-			value = module.BaseAddr() + symAddr + added
+			value = symAddr + added
 			break
 		}
 		if value == 0 {
 			value, _ = m.addSymbolHandler(sym, addr, size, added)
 		}
 	} else {
-		value = m.BaseAddr() + sym.Value + added
+		value = m.resolveSymbolAddress(sym) + added
 	}
 	m.dbg.Emulator().MemWritePtr(addr, size, unsafe.Pointer(&value))
 }
@@ -816,17 +847,28 @@ func (m *module) addSymbolHandler(sym *elf.Symbol, addr, size, added uint64) (ui
 func (m *module) handleRelocation(ctx debugger.Context, data any) {
 	dbg := ctx.Debugger()
 	rd := data.(*relData)
-	module, addr, err := dbg.FindSymbol(rd.sym.Name)
+	_, addr, err := dbg.FindSymbol(rd.sym.Name)
 	if err != nil {
 		panic(fmt.Errorf("%s: %w", rd.sym.Name, err))
 	}
-	addr += module.BaseAddr() + rd.added
+	addr += rd.added
 	ctx.ToPointer(rd.addr).MemWritePtr(rd.size, unsafe.Pointer(&addr))
 	ctx.RegWrite(ctx.PC(), addr)
 	rd.ctrl.Close()
 	m.mu.Lock()
 	m.rels = slices.DeleteFunc(m.rels, func(ctrl debugger.ControlHandler) bool { return ctrl == rd.ctrl })
 	m.mu.Unlock()
+}
+
+func (m *module) resolveSymbolAddress(sym *elf.Symbol) uint64 {
+	if elf.ST_TYPE(sym.Info) != elf.STT_GNU_IFUNC {
+		return m.BaseAddr() + sym.Value
+	} else if value, ok := m.ifunc.Load(sym.Value); ok {
+		return value.(uint64)
+	}
+	value, _ := m.resolve(context.TODO(), m.BaseAddr()+sym.Value)
+	m.ifunc.Store(sym.Value, value)
+	return value
 }
 
 func (m *module) call(ctx context.Context, addr uint64) error {
@@ -840,6 +882,25 @@ func (m *module) call(ctx context.Context, addr uint64) error {
 		return err
 	}
 	return task.SyncRun()
+}
+
+func (m *module) resolve(ctx context.Context, addr uint64) (uint64, error) {
+	task, err := m.dbg.CreateTask(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer task.Close()
+	err = m.dbg.CallTaskOf(task, addr)
+	if err != nil {
+		return 0, err
+	}
+	err = task.SyncRun()
+	if err != nil {
+		return 0, err
+	}
+	var r uintptr
+	task.Context().RetExtract(&r)
+	return uint64(r), nil
 }
 
 func (m *module) parseArray32(r io.Reader) (arr []uint64) {

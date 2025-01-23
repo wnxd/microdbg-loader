@@ -83,17 +83,6 @@ func importRegion(dbg debugger.Debugger, region emulator.MemRegion, offset uint6
 		w := io.NewOffsetWriter(emulator.ToPointer(emu, region.Addr), int64(prog.Vaddr-offset))
 		io.CopyN(w, prog.Open(), int64(prog.Filesz))
 	}
-	// regionEnd := region.Addr + region.Size
-	// for i, section := range f.Sections {
-	// if section.Flags&elf.SHF_WRITE == 0 {
-	// 	continue
-	// }
-	// if section.Size == 0 || section.Addr < region.Addr || (section.Addr+section.Size) >= regionEnd {
-	// 	continue
-	// }
-	// w := io.NewOffsetWriter(emulator.ToPointer(emu, region.Addr), int64(section.Addr-region.Addr))
-	// io.CopyN(w, section.Open(), int64(section.Size))
-	// }
 	module := &module{
 		name:   name,
 		dbg:    dbg,
