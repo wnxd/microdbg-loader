@@ -872,7 +872,7 @@ func (m *module) resolveSymbolAddress(sym *elf.Symbol) uint64 {
 }
 
 func (m *module) call(ctx context.Context, addr uint64) error {
-	task, err := m.dbg.CreateTask(ctx)
+	task, err := m.dbg.GetMainTask(ctx)
 	if err != nil {
 		return err
 	}
@@ -885,7 +885,7 @@ func (m *module) call(ctx context.Context, addr uint64) error {
 }
 
 func (m *module) resolve(ctx context.Context, addr uint64) (uint64, error) {
-	task, err := m.dbg.CreateTask(ctx)
+	task, err := m.dbg.GetMainTask(ctx)
 	if err != nil {
 		return 0, err
 	}
